@@ -21,9 +21,6 @@
   <link rel="icon" sizes="192x192" href="/static/icon-192.png">
   <link rel="icon" type="image/svg+xml"
     href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='22' fill='%230a0a0e'/><path d='M22 66 Q20 38 50 31 Q80 24 80 50 Q80 66 64 72 L40 82 L46 66 Z' fill='white'/></svg>">
-  <link rel="stylesheet"
-    href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark-dimmed.min.css">
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
   <style>
     :root {
       --sat: env(safe-area-inset-top, 0px);
@@ -2441,7 +2438,7 @@
             labelEnd++;
           }
           if (labelEnd >= s.length || s[labelEnd] !== ']' || s[labelEnd + 1] !== '(') {out += s[open]; i = open + 1; continue;}
-          const label = s.slice(open + 1, labelEnd);
+          const label = escHtml(s.slice(open + 1, labelEnd));
           let urlEnd = labelEnd + 2;
           let depth = 1;
           while (urlEnd < s.length && depth > 0) {
@@ -2539,10 +2536,10 @@
         s = res.join('');
         inlineCodes.forEach((c, i) => {s = s.replace(`\x1fIC${i}IC\x1f`, `<span class="ic">${c}</span>`);});
         cbs.forEach(({lang, code}, i) => {
-          const highlighter = window.hljs; let highlighted = '';
-          try {highlighted = highlighter && lang && highlighter.getLanguage(lang) ? highlighter.highlight(code, {language: lang}).value : escHtml(code);}
+          let highlighted = '';
+          try {highlighted = escHtml(code);}
           catch (_) {highlighted = escHtml(code);}
-          s = s.replace(`\x1fCB${i}CB\x1f`, `<div class="cb"><div class="cb-hdr"><span class="cb-lang">${escHtml(lang || 'code')}</span><button class="cb-copy" onclick="cpcode(this)">Másol</button></div><pre><code class="hljs${lang ? ' language-' + escHtml(lang) : ''}">${highlighted}</code></pre></div>`);
+          s = s.replace(`\x1fCB${i}CB\x1f`, `<div class="cb"><div class="cb-hdr"><span class="cb-lang">${escHtml(lang || 'code')}</span><button class="cb-copy" onclick="cpcode(this)">Másol</button></div><pre><code${lang ? ' class="language-' + escHtml(lang) + '"' : ''}>${highlighted}</code></pre></div>`);
         });
         for (let i = 0; i < tables.length; i++) {
           const ph = `|TABLE_${i}|`; const tableHtml = renderTable(tables[i]);
@@ -4079,15 +4076,7 @@
         closeSB();
         initNativeEnhancements();
       }
-      function initHljs() {
-        if (!window.hljs) return;
-        try {
-          if (typeof window.hljs.highlightAll === 'function') window.hljs.highlightAll();
-          else if (typeof window.hljs.initHighlighting === 'function') window.hljs.initHighlighting();
-        } catch(_) {}
-      }
       init();
-      initHljs();
     })();
   </script>
   <div class="ctx-overlay" id="ctx-overlay"></div>
@@ -4670,18 +4659,29 @@
       var AUTH_EMAIL_KEY = 'tiffytime_auth_email';
       var _authEmail = null;
 
-      function authToken() {try {return localStorage.getItem(AUTH_TOKEN_KEY);} catch (_) {return null;}}
+      function migrateStoredToken() {
+        try {
+          var old = localStorage.getItem(AUTH_TOKEN_KEY);
+          if (old && !sessionStorage.getItem(AUTH_TOKEN_KEY)) sessionStorage.setItem(AUTH_TOKEN_KEY, old);
+          localStorage.removeItem(AUTH_TOKEN_KEY);
+        } catch (_) {}
+      }
+      migrateStoredToken();
+
+      function authToken() {try {return sessionStorage.getItem(AUTH_TOKEN_KEY);} catch (_) {return null;}}
       function authEmail() {try {return _authEmail || localStorage.getItem(AUTH_EMAIL_KEY);} catch (_) {return _authEmail;}}
       window.getAuthToken = authToken;
 
       function authSetSession(token, email) {
-        try {localStorage.setItem(AUTH_TOKEN_KEY, token);} catch (_) {}
+        try {sessionStorage.setItem(AUTH_TOKEN_KEY, token);} catch (_) {}
+        try {localStorage.removeItem(AUTH_TOKEN_KEY);} catch (_) {}
         try {localStorage.setItem(AUTH_EMAIL_KEY, email);} catch (_) {}
         _authEmail = email;
         updateAvatarUI(email);
       }
 
       function authClearSession() {
+        try {sessionStorage.removeItem(AUTH_TOKEN_KEY);} catch (_) {}
         try {localStorage.removeItem(AUTH_TOKEN_KEY);} catch (_) {}
         try {localStorage.removeItem(AUTH_EMAIL_KEY);} catch (_) {}
         _authEmail = null;

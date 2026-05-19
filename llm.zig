@@ -203,55 +203,48 @@ pub const ToolCallAccumulator = struct {
     }
 };
 
-pub fn callOpenAIStreamingOnce(allocator: std.mem.Allocator, base_url: []const u8, api_key: []const u8, body: []const u8, callback: anytype, ctx: anytype, started: *bool) !void {
-    const url_str = try std.fmt.allocPrint(allocator, "{s}/chat/completions", .{base_url});
-    defer allocator.free(url_str);
+fn sendHttpSseRequest(allocator: std.mem.Allocator, url: []const u8, api_key: []const u8, body: []const u8, callback: anytype, ctx: anytype, started: *bool) !void {
+    var client = std.http.Client{ .allocator = allocator };
+    defer client.deinit();
 
-    const auth_header = try std.fmt.allocPrint(allocator, "Authorization: Bearer {s}", .{api_key});
+    const uri = try std.Uri.parse(url);
+    const auth_header = try std.fmt.allocPrint(allocator, "Bearer {s}", .{api_key});
     defer allocator.free(auth_header);
 
-    var child = std.process.Child.init(&[_][]const u8{
-        "curl",
-        "-sS",
-        "-N",
-        "--no-buffer",
-        "--fail-with-body",
-        "--max-time", "600",
-        "--connect-timeout", "30",
-        "--retry", "0",
-        "-X", "POST",
-        url_str,
-        "-H", auth_header,
-        "-H", "Content-Type: application/json",
-        "-H", "Accept: text/event-stream",
-        "--data-binary", "@-",
-    }, allocator);
-    child.stdin_behavior = .Pipe;
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Pipe;
+    var server_header_buffer: [16 * 1024]u8 = undefined;
+    var req = try client.open(.POST, uri, .{
+        .server_header_buffer = &server_header_buffer,
+        .headers = .{
+            .authorization = .{ .override = auth_header },
+            .content_type = .{ .override = "application/json" },
+            .connection = .{ .override = "close" },
+        },
+        .extra_headers = &[_]std.http.Header{
+            .{ .name = "Accept", .value = "text/event-stream" },
+        },
+        .keep_alive = false,
+    });
+    defer req.deinit();
+    req.transfer_encoding = .{ .content_length = body.len };
+    try req.send();
+    try req.writeAll(body);
+    try req.finish();
+    try req.wait();
 
-    try child.spawn();
-
-    if (child.stdin) |stdin| {
-        stdin.writeAll(body) catch {};
-        stdin.close();
-        child.stdin = null;
-    }
-
-    var stderr_buf = std.ArrayList(u8).init(allocator);
-    defer stderr_buf.deinit();
+    const status_code: u16 = @intFromEnum(req.response.status);
+    if (status_code < 200 or status_code >= 300) return error.CurlFailed;
 
     var line_buf = std.ArrayList(u8).init(allocator);
     defer line_buf.deinit();
-
+    var read_buf: [4096]u8 = undefined;
     var read_err: ?anyerror = null;
-    if (child.stdout) |stdout| {
-        var reader = stdout.reader();
-        while (true) {
-            const byte = reader.readByte() catch |err| {
-                if (err != error.EndOfStream) read_err = err;
-                break;
-            };
+    while (true) {
+        const n = req.read(&read_buf) catch |err| {
+            read_err = err;
+            break;
+        };
+        if (n == 0) break;
+        for (read_buf[0..n]) |byte| {
             if (byte == '\n') {
                 const line = std.mem.trimRight(u8, line_buf.items, "\r");
                 if (line.len > 0) {
@@ -266,31 +259,19 @@ pub fn callOpenAIStreamingOnce(allocator: std.mem.Allocator, base_url: []const u
                 try line_buf.append(byte);
             }
         }
+        if (read_err != null) break;
     }
-
-    if (child.stderr) |stderr| {
-        stderr.reader().readAllArrayList(&stderr_buf, 65536) catch {};
+    if (line_buf.items.len > 0 and read_err == null) {
+        started.* = true;
+        try callback(allocator, line_buf.items, ctx);
     }
-
-    const term = child.wait() catch |err| {
-        std.log.err("curl wait failed: {}", .{err});
-        return err;
-    };
-
-    switch (term) {
-        .Exited => |code| {
-            if (code != 0) {
-                std.log.err("curl exit code {d}: {s}", .{ code, stderr_buf.items });
-                return error.CurlFailed;
-            }
-        },
-        else => {
-            std.log.err("curl terminated abnormally: {}", .{term});
-            return error.CurlFailed;
-        },
-    }
-
     if (read_err) |err| return err;
+}
+
+pub fn callOpenAIStreamingOnce(allocator: std.mem.Allocator, base_url: []const u8, api_key: []const u8, body: []const u8, callback: anytype, ctx: anytype, started: *bool) !void {
+    const url_str = try std.fmt.allocPrint(allocator, "{s}/chat/completions", .{base_url});
+    defer allocator.free(url_str);
+    try sendHttpSseRequest(allocator, url_str, api_key, body, callback, ctx, started);
 }
 
 pub fn callOpenAIStreaming(allocator: std.mem.Allocator, base_url: []const u8, api_key: []const u8, body: []const u8, callback: anytype, ctx: anytype) !void {
@@ -303,7 +284,7 @@ pub fn callOpenAIStreaming(allocator: std.mem.Allocator, base_url: []const u8, a
         } else |err| {
             if (started or err != error.CurlFailed or attempt + 1 >= max_attempts) return err;
             const backoff_ms: u64 = @as(u64, 600) << @as(u6, @intCast(attempt));
-            std.log.warn("upstream curl failed, retrying in {d}ms (attempt {d}/{d})", .{ backoff_ms, attempt + 2, max_attempts });
+            std.log.warn("upstream request failed, retrying in {d}ms (attempt {d}/{d})", .{ backoff_ms, attempt + 2, max_attempts });
             std.time.sleep(backoff_ms * std.time.ns_per_ms);
         }
     }
