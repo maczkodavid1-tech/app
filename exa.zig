@@ -52,6 +52,48 @@ fn extractUrlHost(url: []const u8) ?[]const u8 {
     return rest[0..end];
 }
 
+fn callExaHttp(allocator: std.mem.Allocator, body: []const u8) ![]u8 {
+    var client = std.http.Client{ .allocator = allocator };
+    defer client.deinit();
+
+    const uri = try std.Uri.parse("https://api.exa.ai/search");
+    var server_header_buffer: [16 * 1024]u8 = undefined;
+    var req = try client.open(.POST, uri, .{
+        .server_header_buffer = &server_header_buffer,
+        .headers = .{
+            .content_type = .{ .override = "application/json" },
+            .connection = .{ .override = "close" },
+        },
+        .extra_headers = &[_]std.http.Header{
+            .{ .name = "x-api-key", .value = root.exa_api_key },
+        },
+        .keep_alive = false,
+    });
+    defer req.deinit();
+    req.transfer_encoding = .{ .content_length = body.len };
+    try req.send();
+    try req.writeAll(body);
+    try req.finish();
+    try req.wait();
+
+    const status_code: u16 = @intFromEnum(req.response.status);
+    if (status_code < 200 or status_code >= 300) {
+        std.log.err("exa http status {d}", .{status_code});
+        return error.CurlFailed;
+    }
+
+    var result_buf = std.ArrayList(u8).init(allocator);
+    errdefer result_buf.deinit();
+    var read_buf: [4096]u8 = undefined;
+    while (true) {
+        const n = try req.read(&read_buf);
+        if (n == 0) break;
+        if (result_buf.items.len + n > 16 * 1024 * 1024) return error.ExaInvalidResponse;
+        try result_buf.appendSlice(read_buf[0..n]);
+    }
+    return result_buf.toOwnedSlice();
+}
+
 pub fn callExaSingle(allocator: std.mem.Allocator, query: []const u8, search_type: ?[]const u8, category: ?[]const u8, start_date: ?[]const u8, end_date: ?[]const u8, include_domains: ?[]const []const u8, exclude_domains: ?[]const []const u8, summary_query: ?[]const u8, max_age_hours: ?i64, system_prompt: ?[]const u8, output_schema: ?std.json.Value) ![]u8 {
     var req_buf = std.ArrayList(u8).init(allocator);
     defer req_buf.deinit();
@@ -124,61 +166,7 @@ pub fn callExaSingle(allocator: std.mem.Allocator, query: []const u8, search_typ
     try w.writeByte('}');
 
     const body = req_buf.items;
-    const url = "https://api.exa.ai/search";
-    const auth_header = try std.fmt.allocPrint(allocator, "x-api-key: {s}", .{root.exa_api_key});
-    defer allocator.free(auth_header);
-
-    var result_buf = std.ArrayList(u8).init(allocator);
-    errdefer result_buf.deinit();
-
-    var child = std.process.Child.init(&[_][]const u8{
-        "curl",
-        "-sS",
-        "--fail-with-body",
-        "--max-time", "90",
-        "--connect-timeout", "15",
-        "-X", "POST",
-        url,
-        "-H", auth_header,
-        "-H", "Content-Type: application/json",
-        "--data-binary", "@-",
-    }, allocator);
-    child.stdin_behavior = .Pipe;
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Inherit;
-
-    try child.spawn();
-
-    if (child.stdin) |stdin| {
-        stdin.writeAll(body) catch |err| {
-            stdin.close();
-            child.stdin = null;
-            _ = child.kill() catch {};
-            return err;
-        };
-        stdin.close();
-        child.stdin = null;
-    }
-
-    if (child.stdout) |stdout| {
-        stdout.reader().readAllArrayList(&result_buf, 16 * 1024 * 1024) catch |err| {
-            _ = child.kill() catch {};
-            return err;
-        };
-    }
-
-    const term = child.wait() catch return error.CurlFailed;
-    switch (term) {
-        .Exited => |code| {
-            if (code != 0) {
-                std.log.err("exa curl exit {d}", .{code});
-                return error.CurlFailed;
-            }
-        },
-        else => return error.CurlFailed,
-    }
-
-    return result_buf.toOwnedSlice();
+    return callExaHttp(allocator, body);
 }
 
 pub const ExaMultiResult = struct {

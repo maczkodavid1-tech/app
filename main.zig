@@ -247,12 +247,15 @@ pub const Message = struct {
 
 pub const Session = struct {
     messages: std.ArrayList(Message),
+    owner_email: ?[]u8,
     created_at: f64,
     updated_at: f64,
 
-    pub fn init(allocator: std.mem.Allocator, created_at: f64) Session {
+    pub fn init(allocator: std.mem.Allocator, created_at: f64, owner_email: ?[]const u8) !Session {
+        const owner_copy: ?[]u8 = if (owner_email) |email| try allocator.dupe(u8, email) else null;
         return Session{
             .messages = std.ArrayList(Message).init(allocator),
+            .owner_email = owner_copy,
             .created_at = created_at,
             .updated_at = created_at,
         };
@@ -261,6 +264,7 @@ pub const Session = struct {
     pub fn deinit(self: *Session, allocator: std.mem.Allocator) void {
         for (self.messages.items) |*msg| msg.deinit(allocator);
         self.messages.deinit();
+        if (self.owner_email) |email| allocator.free(email);
     }
 };
 
@@ -306,7 +310,9 @@ pub const RateLimiter = struct {
                     return;
                 }
                 var oldest: i64 = now_ms;
-                for (self.timestamps.items) |ts| if (ts < oldest) { oldest = ts; };
+                for (self.timestamps.items) |ts| if (ts < oldest) {
+                    oldest = ts;
+                };
                 const wait_until = oldest + window_ms + 50;
                 break :blk @max(0, wait_until - now_ms);
             };
@@ -329,6 +335,10 @@ var deleted_sessions_mutex: std.Thread.Mutex = .{};
 pub var exa_limiter: RateLimiter = undefined;
 var session_exa_limiters_map: std.StringHashMap(*RateLimiter) = undefined;
 var session_exa_limiters_mutex: std.Thread.Mutex = .{};
+
+const RequestContext = struct {
+    allowed_origin: ?[]const u8,
+};
 
 const AuthPasskey = struct {
     credential_id: []u8,
@@ -422,10 +432,9 @@ pub fn generateUuid(allocator: std.mem.Allocator) ![]u8 {
     bytes[8] = (bytes[8] & 0x3f) | 0x80;
     return std.fmt.allocPrint(allocator, "{x:0>2}{x:0>2}{x:0>2}{x:0>2}-{x:0>2}{x:0>2}-{x:0>2}{x:0>2}-{x:0>2}{x:0>2}-{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}", .{
         bytes[0],  bytes[1],  bytes[2],  bytes[3],
-        bytes[4],  bytes[5],
-        bytes[6],  bytes[7],
-        bytes[8],  bytes[9],
-        bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15],
+        bytes[4],  bytes[5],  bytes[6],  bytes[7],
+        bytes[8],  bytes[9],  bytes[10], bytes[11],
+        bytes[12], bytes[13], bytes[14], bytes[15],
     });
 }
 
@@ -521,8 +530,14 @@ fn decodeAndStripB64(allocator: std.mem.Allocator, raw: []const u8) !struct { st
         if (std.mem.indexOf(u8, working, ",")) |comma_idx| working = working[comma_idx + 1 ..];
     }
     const stripped = try stripWhitespace(allocator, working);
-    if (stripped.len == 0) { allocator.free(stripped); return error.EmptyBase64AfterStrip; }
-    const decoded = safeB64Decode(allocator, stripped) catch { allocator.free(stripped); return error.InvalidBase64Encoding; };
+    if (stripped.len == 0) {
+        allocator.free(stripped);
+        return error.EmptyBase64AfterStrip;
+    }
+    const decoded = safeB64Decode(allocator, stripped) catch {
+        allocator.free(stripped);
+        return error.InvalidBase64Encoding;
+    };
     return .{ .stripped = stripped, .decoded = decoded };
 }
 
@@ -574,7 +589,9 @@ fn markDeleted(sid: []const u8) void {
         return;
     }
     const key = global_allocator.dupe(u8, sid) catch return;
-    deleted_sessions_map.put(key, nowSeconds()) catch { global_allocator.free(key); };
+    deleted_sessions_map.put(key, nowSeconds()) catch {
+        global_allocator.free(key);
+    };
 }
 
 fn unmarkDeleted(sid: []const u8) void {
@@ -605,9 +622,29 @@ pub fn getOrCreateExaLimiter(sid: []const u8) !*RateLimiter {
     errdefer global_allocator.destroy(limiter);
     limiter.* = RateLimiter.init(global_allocator, 2);
     const key = try global_allocator.dupe(u8, sid);
-    errdefer { limiter.deinit(); global_allocator.free(key); }
+    errdefer {
+        limiter.deinit();
+        global_allocator.free(key);
+    }
     try session_exa_limiters_map.put(key, limiter);
     return limiter;
+}
+
+fn cleanupSessionResources(sid: []const u8) void {
+    session_exa_limiters_mutex.lock();
+    if (session_exa_limiters_map.fetchRemove(sid)) |kv| {
+        kv.value.deinit();
+        global_allocator.destroy(kv.value);
+        global_allocator.free(kv.key);
+    }
+    session_exa_limiters_mutex.unlock();
+
+    session_locks_guard.lock();
+    if (session_locks_map.fetchRemove(sid)) |kv| {
+        global_allocator.destroy(kv.value);
+        global_allocator.free(kv.key);
+    }
+    session_locks_guard.unlock();
 }
 
 fn evictSessions() void {
@@ -628,7 +665,9 @@ fn evictSessions() void {
                 entry.value_ptr.*.unlock();
             } else {
                 const copy = global_allocator.dupe(u8, entry.key_ptr.*) catch continue;
-                locked_sids.append(copy) catch { global_allocator.free(copy); };
+                locked_sids.append(copy) catch {
+                    global_allocator.free(copy);
+                };
             }
         }
     }
@@ -651,7 +690,10 @@ fn evictSessions() void {
             if (now - entry.value_ptr.*.updated_at > SESSION_TTL) {
                 var is_locked = false;
                 for (locked_sids.items) |ls| {
-                    if (std.mem.eql(u8, ls, entry.key_ptr.*)) { is_locked = true; break; }
+                    if (std.mem.eql(u8, ls, entry.key_ptr.*)) {
+                        is_locked = true;
+                        break;
+                    }
                 }
                 if (!is_locked) to_remove.append(entry.key_ptr.*) catch {};
             }
@@ -676,12 +718,17 @@ fn evictSessions() void {
             while (it2.next()) |entry| {
                 var is_locked = false;
                 for (locked_sids.items) |ls| {
-                    if (std.mem.eql(u8, ls, entry.key_ptr.*)) { is_locked = true; break; }
+                    if (std.mem.eql(u8, ls, entry.key_ptr.*)) {
+                        is_locked = true;
+                        break;
+                    }
                 }
                 if (!is_locked) entries.append(.{ .key = entry.key_ptr.*, .updated_at = entry.value_ptr.*.updated_at }) catch {};
             }
             std.sort.block(SessionEntry, entries.items, {}, struct {
-                fn lessThan(_: void, a: SessionEntry, b: SessionEntry) bool { return a.updated_at < b.updated_at; }
+                fn lessThan(_: void, a: SessionEntry, b: SessionEntry) bool {
+                    return a.updated_at < b.updated_at;
+                }
             }.lessThan);
             const overflow = sessions_map.count() - MAX_SESSIONS;
             for (entries.items[0..@min(overflow, entries.items.len)]) |e| {
@@ -710,17 +757,29 @@ fn evictSessions() void {
             }
         }
     }
+
+    {
+        session_locks_guard.lock();
+        defer session_locks_guard.unlock();
+        for (evicted_sids.items) |sid| {
+            if (session_locks_map.fetchRemove(sid)) |kv| {
+                global_allocator.destroy(kv.value);
+                global_allocator.free(kv.key);
+            }
+        }
+    }
 }
 
 pub fn saveSessionsToDisk() void {
     sessions_disk_mutex.lock();
     defer sessions_disk_mutex.unlock();
 
-    const SessSnap = struct { sid: []u8, messages_json: []u8, created_at: f64, updated_at: f64 };
+    const SessSnap = struct { sid: []u8, owner_email: ?[]u8, messages_json: []u8, created_at: f64, updated_at: f64 };
     var snaps = std.ArrayList(SessSnap).init(global_allocator);
     defer {
         for (snaps.items) |s| {
             global_allocator.free(s.sid);
+            if (s.owner_email) |email| global_allocator.free(email);
             global_allocator.free(s.messages_json);
         }
         snaps.deinit();
@@ -732,23 +791,28 @@ pub fn saveSessionsToDisk() void {
         var it = sessions_map.iterator();
         while (it.next()) |entry| {
             const sid_copy = global_allocator.dupe(u8, entry.key_ptr.*) catch continue;
+            const owner_copy: ?[]u8 = if (entry.value_ptr.*.owner_email) |email| global_allocator.dupe(u8, email) catch null else null;
             var msg_buf = std.ArrayList(u8).init(global_allocator);
             serializeMessages(msg_buf.writer(), entry.value_ptr.*.messages.items) catch {
+                if (owner_copy) |email| global_allocator.free(email);
                 msg_buf.deinit();
                 global_allocator.free(sid_copy);
                 continue;
             };
             const msg_json = msg_buf.toOwnedSlice() catch {
+                if (owner_copy) |email| global_allocator.free(email);
                 msg_buf.deinit();
                 global_allocator.free(sid_copy);
                 continue;
             };
             snaps.append(.{
                 .sid = sid_copy,
+                .owner_email = owner_copy,
                 .messages_json = msg_json,
                 .created_at = entry.value_ptr.*.created_at,
                 .updated_at = entry.value_ptr.*.updated_at,
             }) catch {
+                if (owner_copy) |email| global_allocator.free(email);
                 global_allocator.free(sid_copy);
                 global_allocator.free(msg_json);
                 continue;
@@ -765,6 +829,11 @@ pub fn saveSessionsToDisk() void {
         writeJsonString(w, snap.sid) catch return;
         w.writeByte(':') catch return;
         w.writeByte('{') catch return;
+        if (snap.owner_email) |email| {
+            w.writeAll("\"owner_email\":") catch return;
+            writeJsonString(w, email) catch return;
+            w.writeByte(',') catch return;
+        }
         w.writeAll("\"messages\":") catch return;
         w.writeAll(snap.messages_json) catch return;
         w.writeAll(",\"created_at\":") catch return;
@@ -834,20 +903,47 @@ pub fn writeJsonString(writer: anytype, s: []const u8) !void {
     while (i < s.len) {
         const c = s[i];
         switch (c) {
-            '"' => { try writer.writeAll("\\\""); i += 1; },
-            '\\' => { try writer.writeAll("\\\\"); i += 1; },
-            '\n' => { try writer.writeAll("\\n"); i += 1; },
-            '\r' => { try writer.writeAll("\\r"); i += 1; },
-            '\t' => { try writer.writeAll("\\t"); i += 1; },
-            0x00...0x08, 0x0b, 0x0c, 0x0e...0x1f => { try std.fmt.format(writer, "\\u{x:0>4}", .{c}); i += 1; },
-            0x80...0xBF => { try writer.writeAll("\\ufffd"); i += 1; },
-            0xC0...0xC1, 0xF5...0xFF => { try writer.writeAll("\\ufffd"); i += 1; },
+            '"' => {
+                try writer.writeAll("\\\"");
+                i += 1;
+            },
+            '\\' => {
+                try writer.writeAll("\\\\");
+                i += 1;
+            },
+            '\n' => {
+                try writer.writeAll("\\n");
+                i += 1;
+            },
+            '\r' => {
+                try writer.writeAll("\\r");
+                i += 1;
+            },
+            '\t' => {
+                try writer.writeAll("\\t");
+                i += 1;
+            },
+            0x00...0x08, 0x0b, 0x0c, 0x0e...0x1f => {
+                try std.fmt.format(writer, "\\u{x:0>4}", .{c});
+                i += 1;
+            },
+            0x80...0xBF => {
+                try writer.writeAll("\\ufffd");
+                i += 1;
+            },
+            0xC0...0xC1, 0xF5...0xFF => {
+                try writer.writeAll("\\ufffd");
+                i += 1;
+            },
             0xC2...0xDF => {
                 if (i + 1 < s.len and (s[i + 1] & 0xC0) == 0x80) {
                     try writer.writeByte(c);
                     try writer.writeByte(s[i + 1]);
                     i += 2;
-                } else { try writer.writeAll("\\ufffd"); i += 1; }
+                } else {
+                    try writer.writeAll("\\ufffd");
+                    i += 1;
+                }
             },
             0xE0...0xEF => {
                 if (i + 2 < s.len and (s[i + 1] & 0xC0) == 0x80 and (s[i + 2] & 0xC0) == 0x80) {
@@ -855,7 +951,10 @@ pub fn writeJsonString(writer: anytype, s: []const u8) !void {
                     try writer.writeByte(s[i + 1]);
                     try writer.writeByte(s[i + 2]);
                     i += 3;
-                } else { try writer.writeAll("\\ufffd"); i += 1; }
+                } else {
+                    try writer.writeAll("\\ufffd");
+                    i += 1;
+                }
             },
             0xF0...0xF4 => {
                 if (i + 3 < s.len and (s[i + 1] & 0xC0) == 0x80 and (s[i + 2] & 0xC0) == 0x80 and (s[i + 3] & 0xC0) == 0x80) {
@@ -864,9 +963,15 @@ pub fn writeJsonString(writer: anytype, s: []const u8) !void {
                     try writer.writeByte(s[i + 2]);
                     try writer.writeByte(s[i + 3]);
                     i += 4;
-                } else { try writer.writeAll("\\ufffd"); i += 1; }
+                } else {
+                    try writer.writeAll("\\ufffd");
+                    i += 1;
+                }
             },
-            else => { try writer.writeByte(c); i += 1; },
+            else => {
+                try writer.writeByte(c);
+                i += 1;
+            },
         }
     }
     try writer.writeByte('"');
@@ -913,8 +1018,14 @@ pub fn serializeMessage(writer: anytype, msg: Message) !void {
         }
         try writer.writeByte(']');
     }
-    if (msg.tool_call_id) |id| { try writer.writeAll(",\"tool_call_id\":"); try writeJsonString(writer, id); }
-    if (msg.msg_id) |mid| { try writer.writeAll(",\"msg_id\":"); try writeJsonString(writer, mid); }
+    if (msg.tool_call_id) |id| {
+        try writer.writeAll(",\"tool_call_id\":");
+        try writeJsonString(writer, id);
+    }
+    if (msg.msg_id) |mid| {
+        try writer.writeAll(",\"msg_id\":");
+        try writeJsonString(writer, mid);
+    }
     try writer.writeByte('}');
 }
 
@@ -922,10 +1033,22 @@ pub fn serializeContentPart(writer: anytype, part: MessageContentPart) !void {
     try writer.writeByte('{');
     try writer.writeAll("\"type\":");
     try writeJsonString(writer, part.type);
-    if (part.text) |t| { try writer.writeAll(",\"text\":"); try writeJsonString(writer, t); }
-    if (part.media_type) |m| { try writer.writeAll(",\"media_type\":"); try writeJsonString(writer, m); }
-    if (part.data) |d| { try writer.writeAll(",\"data\":"); try writeJsonString(writer, d); }
-    if (part.key) |k| { try writer.writeAll(",\"key\":"); try writeJsonString(writer, k); }
+    if (part.text) |t| {
+        try writer.writeAll(",\"text\":");
+        try writeJsonString(writer, t);
+    }
+    if (part.media_type) |m| {
+        try writer.writeAll(",\"media_type\":");
+        try writeJsonString(writer, m);
+    }
+    if (part.data) |d| {
+        try writer.writeAll(",\"data\":");
+        try writeJsonString(writer, d);
+    }
+    if (part.key) |k| {
+        try writer.writeAll(",\"key\":");
+        try writeJsonString(writer, k);
+    }
     if (part.image_url) |iu| {
         try writer.writeAll(",\"image_url\":{\"url\":");
         try writeJsonString(writer, iu.url);
@@ -963,6 +1086,7 @@ fn loadSessionsFromDisk() void {
         const msgs_val = v.object.get("messages") orelse continue;
         const updated_val = v.object.get("updated_at") orelse continue;
         const created_val = v.object.get("created_at") orelse v.object.get("updated_at") orelse continue;
+        const owner_email: ?[]const u8 = if (v.object.get("owner_email")) |ov| if (ov == .string and ov.string.len > 0) ov.string else null else null;
         if (msgs_val != .array) continue;
 
         const updated_at = jsonValueToFloat(updated_val);
@@ -970,7 +1094,7 @@ fn loadSessionsFromDisk() void {
 
         const created_at = jsonValueToFloat(created_val);
 
-        var sess = Session.init(global_allocator, created_at);
+        var sess = Session.init(global_allocator, created_at, owner_email) catch continue;
         sess.updated_at = updated_at;
 
         var msg_count: usize = 0;
@@ -978,11 +1102,18 @@ fn loadSessionsFromDisk() void {
             if (msg_count >= MAX_STORED_MESSAGES) break;
             if (msg_val != .object) continue;
             const msg = parseMessageFromJson(msg_val) catch continue;
-            sess.messages.append(msg) catch { var m = msg; m.deinit(global_allocator); continue; };
+            sess.messages.append(msg) catch {
+                var m = msg;
+                m.deinit(global_allocator);
+                continue;
+            };
             msg_count += 1;
         }
 
-        const key = global_allocator.dupe(u8, k) catch { sess.deinit(global_allocator); continue; };
+        const key = global_allocator.dupe(u8, k) catch {
+            sess.deinit(global_allocator);
+            continue;
+        };
         sessions_mutex.lock();
         sessions_map.put(key, sess) catch {
             sessions_mutex.unlock();
@@ -1071,8 +1202,11 @@ fn parseMessageFromJson(v: std.json.Value) !Message {
     const msg_id = if (obj.get("msg_id")) |mid_val| if (mid_val == .string) try global_allocator.dupe(u8, mid_val.string) else null else null;
 
     return Message{
-        .role = role, .content = content, .tool_calls = tool_calls,
-        .tool_call_id = tool_call_id, .msg_id = msg_id,
+        .role = role,
+        .content = content,
+        .tool_calls = tool_calls,
+        .tool_call_id = tool_call_id,
+        .msg_id = msg_id,
         .cached_size = null,
     };
 }
@@ -1162,16 +1296,24 @@ pub fn messageCharSize(msg: *Message) usize {
                 if (std.mem.eql(u8, ptype, "text")) {
                     total += if (part.text) |t| t.len else 0;
                 } else if (std.mem.eql(u8, ptype, "image_url")) {
-                    if (part.image_url) |iu| { total += iu.url.len + iu.detail.len + 32; } else { total += 32; }
+                    if (part.image_url) |iu| {
+                        total += iu.url.len + iu.detail.len + 32;
+                    } else {
+                        total += 32;
+                    }
                 } else if (std.mem.eql(u8, ptype, "image_ref")) {
                     total += (if (part.key) |k| k.len else 0) + (if (part.media_type) |m| m.len else 0) + 32;
                 } else if (std.mem.eql(u8, ptype, "image_inline")) {
                     total += (if (part.data) |d| d.len else 0) + (if (part.media_type) |m| m.len else 0) + 32;
-                } else { total += 64; }
+                } else {
+                    total += 64;
+                }
             }
         },
     }
-    if (msg.tool_calls) |tcs| { for (tcs.items) |tc| total += tc.id.len + tc.type.len + tc.function.name.len + tc.function.arguments.len + 32; }
+    if (msg.tool_calls) |tcs| {
+        for (tcs.items) |tc| total += tc.id.len + tc.type.len + tc.function.name.len + tc.function.arguments.len + 32;
+    }
     if (msg.tool_call_id) |id| total += id.len;
     if (msg.msg_id) |mid| total += mid.len;
     msg.cached_size = total;
@@ -1190,11 +1332,17 @@ fn findToolBoundary(messages: []const Message, start_idx: usize) usize {
     var idx = start_idx;
     while (idx < messages.len) {
         const m = messages[idx];
-        if (std.mem.eql(u8, m.role, "tool")) { idx += 1; continue; }
+        if (std.mem.eql(u8, m.role, "tool")) {
+            idx += 1;
+            continue;
+        }
         if (std.mem.eql(u8, m.role, "assistant") and m.tool_calls != null and idx + 1 < messages.len) {
             var j = idx + 1;
             while (j < messages.len and std.mem.eql(u8, messages[j].role, "tool")) j += 1;
-            if (j > idx + 1) { idx = j; continue; }
+            if (j > idx + 1) {
+                idx = j;
+                continue;
+            }
         }
         break;
     }
@@ -1265,7 +1413,10 @@ fn stripOrphanedAssistantToolCalls(allocator: std.mem.Allocator, messages: *std.
                     .parts => |parts| {
                         for (parts.items) |part| {
                             if (std.mem.eql(u8, part.type, "text")) {
-                                if (part.text) |t| { text_content = t; break; }
+                                if (part.text) |t| {
+                                    text_content = t;
+                                    break;
+                                }
                             }
                         }
                     },
@@ -1279,7 +1430,8 @@ fn stripOrphanedAssistantToolCalls(allocator: std.mem.Allocator, messages: *std.
                 try cleaned.append(Message{
                     .role = role_copy,
                     .content = MessageContent{ .text = text_copy },
-                    .tool_calls = null, .tool_call_id = null,
+                    .tool_calls = null,
+                    .tool_call_id = null,
                     .msg_id = mid_copy,
                     .cached_size = null,
                 });
@@ -1372,7 +1524,10 @@ pub fn rollbackSessionTurn(sid: []const u8, msg_id: []const u8) void {
     if (sessions_map.getPtr(sid)) |sess| {
         var entry_start: ?usize = null;
         for (sess.messages.items, 0..) |msg, i| {
-            if (msg.msg_id) |mid| if (std.mem.eql(u8, mid, msg_id)) { entry_start = i; break; };
+            if (msg.msg_id) |mid| if (std.mem.eql(u8, mid, msg_id)) {
+                entry_start = i;
+                break;
+            };
         }
         if (entry_start) |start| {
             for (sess.messages.items[start..]) |*msg| msg.deinit(global_allocator);
@@ -1392,7 +1547,8 @@ pub fn getSystemPrompt(allocator: std.mem.Allocator) ![]u8 {
     const total_minutes = @divTrunc(@mod(now_ms, 86400_000), 60000);
     const hour = @divTrunc(total_minutes, 60);
     const minute = @mod(total_minutes, 60);
-    return std.fmt.allocPrint(allocator,
+    return std.fmt.allocPrint(
+        allocator,
         "You are tiffytime, an intelligent AI assistant.\nCurrent date: {d:0>4}-{d:0>2}-{d:0>2} | Current time: {d:0>2}:{d:0>2} UTC\n\nSEARCH RULES:\n- Use exa_search when the question requires current information, recent events, news, prices, people, sports results, or anything that may have changed.\n- Do NOT search for simple greetings, general knowledge, math, or timeless facts.\n- Provide multiple queries in the 'queries' array for comprehensive coverage.\n\nANSWER RULES:\n- If you searched: base your answer EXCLUSIVELY on the search result summaries received. Do NOT use your internal knowledge.\n- If you did not search: answer directly from your knowledge.\n- Synthesize the summaries into a clear, well-structured answer.\n- Cite sources with URLs where relevant.\n- Match the user's language and tone.\n- Be concise for simple questions, thorough for complex ones.",
         .{ year_day.year, month_day.month.numeric(), month_day.day_index + 1, hour, minute },
     );
@@ -1623,7 +1779,10 @@ fn parseAttestationObject(allocator: std.mem.Allocator, cbor_data: []const u8) !
     var auth_data: ?[]const u8 = null;
 
     for (0..map_len) |_| {
-        const key_head = reader.readHead() catch { reader.skipValue() catch {}; continue; };
+        const key_head = reader.readHead() catch {
+            reader.skipValue() catch {};
+            continue;
+        };
         if (key_head.major == 3) {
             if (key_head.val > reader.data.len) return error.CborUnexpectedEof;
             const key_len: usize = @intCast(key_head.val);
@@ -1682,8 +1841,12 @@ fn parseAuthData(allocator: std.mem.Allocator, auth_data: []const u8) !AuthDataR
     errdefer allocator.free(cred_id_copy);
     const cose_key_copy = try allocator.dupe(u8, cose_key_data);
     return AuthDataResult{
-        .rp_id_hash = rp_id_hash, .flags = flags, .sign_count = sign_count,
-        .cred_id = cred_id_copy, .cose_key = cose_key_copy, .allocator = allocator,
+        .rp_id_hash = rp_id_hash,
+        .flags = flags,
+        .sign_count = sign_count,
+        .cred_id = cred_id_copy,
+        .cose_key = cose_key_copy,
+        .allocator = allocator,
     };
 }
 
@@ -1727,14 +1890,22 @@ fn parseCoseP256Key(cose_data: []const u8) ![65]u8 {
                 };
             },
             -2 => {
-                const xb = reader.readBytes() catch { reader.skipValue() catch {}; continue; };
+                const xb = reader.readBytes() catch {
+                    reader.skipValue() catch {};
+                    continue;
+                };
                 if (xb.len == 32) x = xb[0..32].*;
             },
             -3 => {
-                const yb = reader.readBytes() catch { reader.skipValue() catch {}; continue; };
+                const yb = reader.readBytes() catch {
+                    reader.skipValue() catch {};
+                    continue;
+                };
                 if (yb.len == 32) y = yb[0..32].*;
             },
-            else => { reader.skipValue() catch {}; },
+            else => {
+                reader.skipValue() catch {};
+            },
         }
     }
 
@@ -1855,7 +2026,10 @@ fn addCredIdIndex(cred_id: []const u8, email: []const u8) void {
     defer cred_id_map_mutex.unlock();
     if (cred_id_to_email.contains(cred_id)) return;
     const key = global_allocator.dupe(u8, cred_id) catch return;
-    const val = global_allocator.dupe(u8, email) catch { global_allocator.free(key); return; };
+    const val = global_allocator.dupe(u8, email) catch {
+        global_allocator.free(key);
+        return;
+    };
     cred_id_to_email.put(key, val) catch {
         global_allocator.free(key);
         global_allocator.free(val);
@@ -1939,8 +2113,14 @@ fn loadAuthFromDisk() void {
                         }
                     }
 
-                    const key = global_allocator.dupe(u8, email_key) catch { user.deinit(global_allocator); break :errdefer_user_id; };
-                    auth_users.put(key, user) catch { user.deinit(global_allocator); global_allocator.free(key); };
+                    const key = global_allocator.dupe(u8, email_key) catch {
+                        user.deinit(global_allocator);
+                        break :errdefer_user_id;
+                    };
+                    auth_users.put(key, user) catch {
+                        user.deinit(global_allocator);
+                        global_allocator.free(key);
+                    };
                 }
             }
         }
@@ -2002,6 +2182,31 @@ fn extractRpId(origin: []const u8) []const u8 {
     return s;
 }
 
+fn normalizeOrigin(raw: []const u8) []const u8 {
+    if (std.mem.indexOf(u8, raw, "//")) |dslash| {
+        const after_scheme = raw[dslash + 2 ..];
+        const path_idx = std.mem.indexOf(u8, after_scheme, "/") orelse after_scheme.len;
+        return raw[0 .. dslash + 2 + path_idx];
+    }
+    return raw;
+}
+
+fn jsonStringField(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
+    const v = obj.get(key) orelse return null;
+    return if (v == .string) v.string else null;
+}
+
+fn validateClientData(value: std.json.Value, expected_type: []const u8, expected_challenge: []const u8, expected_origin: []const u8) bool {
+    if (value != .object) return false;
+    const obj = value.object;
+    const typ = jsonStringField(obj, "type") orelse return false;
+    if (!std.mem.eql(u8, typ, expected_type)) return false;
+    const challenge = jsonStringField(obj, "challenge") orelse return false;
+    if (!std.mem.eql(u8, challenge, expected_challenge)) return false;
+    const origin = jsonStringField(obj, "origin") orelse return false;
+    return std.mem.eql(u8, normalizeOrigin(origin), normalizeOrigin(expected_origin));
+}
+
 fn getAuthEmailFromToken(allocator: std.mem.Allocator, headers: *const std.StringHashMap([]const u8)) ?[]u8 {
     const auth_header = headers.get("authorization") orelse return null;
     if (!std.mem.startsWith(u8, auth_header, "Bearer ")) return null;
@@ -2031,14 +2236,29 @@ fn handleAuthRegister(allocator: std.mem.Allocator, writer: anytype, body: []con
         return;
     }
 
-    const email_v = parsed.value.object.get("email") orelse { try sendHttpResponse(writer, 400, "Bad Request", "application/json", &[_][2][]const u8{}, "{\"error\":\"E-mail cím szükséges\"}"); return; };
-    const pw_v = parsed.value.object.get("password") orelse { try sendHttpResponse(writer, 400, "Bad Request", "application/json", &[_][2][]const u8{}, "{\"error\":\"Jelszó szükséges\"}"); return; };
-    if (email_v != .string or pw_v != .string) { try sendHttpResponse(writer, 400, "Bad Request", "application/json", &[_][2][]const u8{}, "{\"error\":\"Érvénytelen mezők\"}"); return; }
+    const email_v = parsed.value.object.get("email") orelse {
+        try sendHttpResponse(writer, 400, "Bad Request", "application/json", &[_][2][]const u8{}, "{\"error\":\"E-mail cím szükséges\"}");
+        return;
+    };
+    const pw_v = parsed.value.object.get("password") orelse {
+        try sendHttpResponse(writer, 400, "Bad Request", "application/json", &[_][2][]const u8{}, "{\"error\":\"Jelszó szükséges\"}");
+        return;
+    };
+    if (email_v != .string or pw_v != .string) {
+        try sendHttpResponse(writer, 400, "Bad Request", "application/json", &[_][2][]const u8{}, "{\"error\":\"Érvénytelen mezők\"}");
+        return;
+    }
 
     const email = std.mem.trim(u8, email_v.string, " \t\n\r");
     const password = pw_v.string;
-    if (email.len < 3 or !std.mem.containsAtLeast(u8, email, 1, "@")) { try sendHttpResponse(writer, 400, "Bad Request", "application/json", &[_][2][]const u8{}, "{\"error\":\"Érvénytelen e-mail cím\"}"); return; }
-    if (password.len < 8) { try sendHttpResponse(writer, 400, "Bad Request", "application/json", &[_][2][]const u8{}, "{\"error\":\"A jelszónak legalább 8 karakter hosszúnak kell lennie\"}"); return; }
+    if (email.len < 3 or !std.mem.containsAtLeast(u8, email, 1, "@")) {
+        try sendHttpResponse(writer, 400, "Bad Request", "application/json", &[_][2][]const u8{}, "{\"error\":\"Érvénytelen e-mail cím\"}");
+        return;
+    }
+    if (password.len < 8) {
+        try sendHttpResponse(writer, 400, "Bad Request", "application/json", &[_][2][]const u8{}, "{\"error\":\"A jelszónak legalább 8 karakter hosszúnak kell lennie\"}");
+        return;
+    }
 
     const hash = hashPassword(allocator, password) catch {
         try sendHttpResponse(writer, 500, "Internal Server Error", "application/json", &[_][2][]const u8{}, "{\"error\":\"Szerverhiba\"}");
@@ -2143,11 +2363,23 @@ fn handleAuthLogin(allocator: std.mem.Allocator, writer: anytype, body: []const 
         return;
     };
     defer parsed.deinit();
-    if (parsed.value != .object) { try sendHttpResponse(writer, 400, "Bad Request", "application/json", &[_][2][]const u8{}, "{\"error\":\"Érvénytelen kérés\"}"); return; }
+    if (parsed.value != .object) {
+        try sendHttpResponse(writer, 400, "Bad Request", "application/json", &[_][2][]const u8{}, "{\"error\":\"Érvénytelen kérés\"}");
+        return;
+    }
 
-    const email_v = parsed.value.object.get("email") orelse { try sendHttpResponse(writer, 400, "Bad Request", "application/json", &[_][2][]const u8{}, "{\"error\":\"E-mail cím szükséges\"}"); return; };
-    const pw_v = parsed.value.object.get("password") orelse { try sendHttpResponse(writer, 400, "Bad Request", "application/json", &[_][2][]const u8{}, "{\"error\":\"Jelszó szükséges\"}"); return; };
-    if (email_v != .string or pw_v != .string) { try sendHttpResponse(writer, 400, "Bad Request", "application/json", &[_][2][]const u8{}, "{\"error\":\"Érvénytelen mezők\"}"); return; }
+    const email_v = parsed.value.object.get("email") orelse {
+        try sendHttpResponse(writer, 400, "Bad Request", "application/json", &[_][2][]const u8{}, "{\"error\":\"E-mail cím szükséges\"}");
+        return;
+    };
+    const pw_v = parsed.value.object.get("password") orelse {
+        try sendHttpResponse(writer, 400, "Bad Request", "application/json", &[_][2][]const u8{}, "{\"error\":\"Jelszó szükséges\"}");
+        return;
+    };
+    if (email_v != .string or pw_v != .string) {
+        try sendHttpResponse(writer, 400, "Bad Request", "application/json", &[_][2][]const u8{}, "{\"error\":\"Érvénytelen mezők\"}");
+        return;
+    }
 
     const email = std.mem.trim(u8, email_v.string, " \t\n\r");
     const password = pw_v.string;
@@ -2266,7 +2498,9 @@ fn handleWebAuthnRegisterChallenge(allocator: std.mem.Allocator, writer: anytype
 
     var email: []const u8 = "";
     if (parsed.value == .object) {
-        if (parsed.value.object.get("email")) |ev| if (ev == .string) { email = std.mem.trim(u8, ev.string, " \t\n\r"); };
+        if (parsed.value.object.get("email")) |ev| if (ev == .string) {
+            email = std.mem.trim(u8, ev.string, " \t\n\r");
+        };
     }
 
     var token_email: ?[]u8 = null;
@@ -2373,12 +2607,24 @@ fn handleWebAuthnRegisterVerify(allocator: std.mem.Allocator, writer: anytype, b
         return;
     };
     defer parsed.deinit();
-    if (parsed.value != .object) { try sendHttpResponse(writer, 400, "Bad Request", "application/json", &[_][2][]const u8{}, "{\"error\":\"Érvénytelen kérés\"}"); return; }
+    if (parsed.value != .object) {
+        try sendHttpResponse(writer, 400, "Bad Request", "application/json", &[_][2][]const u8{}, "{\"error\":\"Érvénytelen kérés\"}");
+        return;
+    }
     const obj = parsed.value.object;
 
-    const challenge_v = obj.get("challenge") orelse { try sendHttpResponse(writer, 400, "Bad Request", "application/json", &[_][2][]const u8{}, "{\"error\":\"Hiányzó challenge\"}"); return; };
-    const cdj_v = obj.get("clientDataJSON") orelse { try sendHttpResponse(writer, 400, "Bad Request", "application/json", &[_][2][]const u8{}, "{\"error\":\"Hiányzó clientDataJSON\"}"); return; };
-    const ao_v = obj.get("attestationObject") orelse { try sendHttpResponse(writer, 400, "Bad Request", "application/json", &[_][2][]const u8{}, "{\"error\":\"Hiányzó attestationObject\"}"); return; };
+    const challenge_v = obj.get("challenge") orelse {
+        try sendHttpResponse(writer, 400, "Bad Request", "application/json", &[_][2][]const u8{}, "{\"error\":\"Hiányzó challenge\"}");
+        return;
+    };
+    const cdj_v = obj.get("clientDataJSON") orelse {
+        try sendHttpResponse(writer, 400, "Bad Request", "application/json", &[_][2][]const u8{}, "{\"error\":\"Hiányzó clientDataJSON\"}");
+        return;
+    };
+    const ao_v = obj.get("attestationObject") orelse {
+        try sendHttpResponse(writer, 400, "Bad Request", "application/json", &[_][2][]const u8{}, "{\"error\":\"Hiányzó attestationObject\"}");
+        return;
+    };
 
     if (challenge_v != .string or cdj_v != .string or ao_v != .string) {
         try sendHttpResponse(writer, 400, "Bad Request", "application/json", &[_][2][]const u8{}, "{\"error\":\"Érvénytelen mezők\"}");
@@ -2434,19 +2680,9 @@ fn handleWebAuthnRegisterVerify(allocator: std.mem.Allocator, writer: anytype, b
     };
     defer cdj_parsed.deinit();
 
-    if (cdj_parsed.value == .object) {
-        if (cdj_parsed.value.object.get("type")) |tv| {
-            if (tv != .string or !std.mem.eql(u8, tv.string, "webauthn.create")) {
-                try sendHttpResponse(writer, 400, "Bad Request", "application/json", &[_][2][]const u8{}, "{\"error\":\"Érvénytelen webauthn típus\"}");
-                return;
-            }
-        }
-        if (cdj_parsed.value.object.get("challenge")) |chv| {
-            if (chv != .string or !std.mem.eql(u8, chv.string, challenge)) {
-                try sendHttpResponse(writer, 400, "Bad Request", "application/json", &[_][2][]const u8{}, "{\"error\":\"Challenge nem egyezik\"}");
-                return;
-            }
-        }
+    if (!validateClientData(cdj_parsed.value, "webauthn.create", challenge, stored_origin)) {
+        try sendHttpResponse(writer, 400, "Bad Request", "application/json", &[_][2][]const u8{}, "{\"error\":\"Érvénytelen webauthn clientData\"}");
+        return;
     }
 
     const ao_bytes = base64UrlDecode(allocator, ao_v.string) catch safeB64Decode(allocator, ao_v.string) catch {
@@ -2649,7 +2885,9 @@ fn handleWebAuthnLoginChallenge(allocator: std.mem.Allocator, writer: anytype, b
 
     var email: []const u8 = "";
     if (parsed.value == .object) {
-        if (parsed.value.object.get("email")) |ev| if (ev == .string) { email = std.mem.trim(u8, ev.string, " \t\n\r"); };
+        if (parsed.value.object.get("email")) |ev| if (ev == .string) {
+            email = std.mem.trim(u8, ev.string, " \t\n\r");
+        };
     }
 
     const challenge = generateChallenge(allocator) catch {
@@ -2712,14 +2950,32 @@ fn handleWebAuthnLoginVerify(allocator: std.mem.Allocator, writer: anytype, body
         return;
     };
     defer parsed.deinit();
-    if (parsed.value != .object) { try sendHttpResponse(writer, 400, "Bad Request", "application/json", &[_][2][]const u8{}, "{\"error\":\"Érvénytelen kérés\"}"); return; }
+    if (parsed.value != .object) {
+        try sendHttpResponse(writer, 400, "Bad Request", "application/json", &[_][2][]const u8{}, "{\"error\":\"Érvénytelen kérés\"}");
+        return;
+    }
     const obj = parsed.value.object;
 
-    const challenge_v = obj.get("challenge") orelse { try sendHttpResponse(writer, 400, "Bad Request", "application/json", &[_][2][]const u8{}, "{\"error\":\"Hiányzó challenge\"}"); return; };
-    const cred_id_v = obj.get("credentialId") orelse { try sendHttpResponse(writer, 400, "Bad Request", "application/json", &[_][2][]const u8{}, "{\"error\":\"Hiányzó credentialId\"}"); return; };
-    const auth_data_v = obj.get("authenticatorData") orelse { try sendHttpResponse(writer, 400, "Bad Request", "application/json", &[_][2][]const u8{}, "{\"error\":\"Hiányzó authenticatorData\"}"); return; };
-    const cdj_v = obj.get("clientDataJSON") orelse { try sendHttpResponse(writer, 400, "Bad Request", "application/json", &[_][2][]const u8{}, "{\"error\":\"Hiányzó clientDataJSON\"}"); return; };
-    const sig_v = obj.get("signature") orelse { try sendHttpResponse(writer, 400, "Bad Request", "application/json", &[_][2][]const u8{}, "{\"error\":\"Hiányzó signature\"}"); return; };
+    const challenge_v = obj.get("challenge") orelse {
+        try sendHttpResponse(writer, 400, "Bad Request", "application/json", &[_][2][]const u8{}, "{\"error\":\"Hiányzó challenge\"}");
+        return;
+    };
+    const cred_id_v = obj.get("credentialId") orelse {
+        try sendHttpResponse(writer, 400, "Bad Request", "application/json", &[_][2][]const u8{}, "{\"error\":\"Hiányzó credentialId\"}");
+        return;
+    };
+    const auth_data_v = obj.get("authenticatorData") orelse {
+        try sendHttpResponse(writer, 400, "Bad Request", "application/json", &[_][2][]const u8{}, "{\"error\":\"Hiányzó authenticatorData\"}");
+        return;
+    };
+    const cdj_v = obj.get("clientDataJSON") orelse {
+        try sendHttpResponse(writer, 400, "Bad Request", "application/json", &[_][2][]const u8{}, "{\"error\":\"Hiányzó clientDataJSON\"}");
+        return;
+    };
+    const sig_v = obj.get("signature") orelse {
+        try sendHttpResponse(writer, 400, "Bad Request", "application/json", &[_][2][]const u8{}, "{\"error\":\"Hiányzó signature\"}");
+        return;
+    };
 
     if (challenge_v != .string or cred_id_v != .string or auth_data_v != .string or cdj_v != .string or sig_v != .string) {
         try sendHttpResponse(writer, 400, "Bad Request", "application/json", &[_][2][]const u8{}, "{\"error\":\"Érvénytelen mezők\"}");
@@ -2862,19 +3118,9 @@ fn handleWebAuthnLoginVerify(allocator: std.mem.Allocator, writer: anytype, body
     };
     defer cdj_parsed2.deinit();
 
-    if (cdj_parsed2.value == .object) {
-        if (cdj_parsed2.value.object.get("type")) |tv| {
-            if (tv != .string or !std.mem.eql(u8, tv.string, "webauthn.get")) {
-                try sendHttpResponse(writer, 400, "Bad Request", "application/json", &[_][2][]const u8{}, "{\"error\":\"Érvénytelen webauthn típus\"}");
-                return;
-            }
-        }
-        if (cdj_parsed2.value.object.get("challenge")) |chv| {
-            if (chv != .string or !std.mem.eql(u8, chv.string, challenge)) {
-                try sendHttpResponse(writer, 400, "Bad Request", "application/json", &[_][2][]const u8{}, "{\"error\":\"Challenge nem egyezik\"}");
-                return;
-            }
-        }
+    if (!validateClientData(cdj_parsed2.value, "webauthn.get", challenge, stored_origin)) {
+        try sendHttpResponse(writer, 400, "Bad Request", "application/json", &[_][2][]const u8{}, "{\"error\":\"Érvénytelen webauthn clientData\"}");
+        return;
     }
 
     const rp_id = extractRpId(stored_origin);
@@ -2959,28 +3205,43 @@ fn handleWebAuthnLoginVerify(allocator: std.mem.Allocator, writer: anytype, body
     try sendHttpResponse(writer, 200, "OK", "application/json", &[_][2][]const u8{}, resp_buf.items);
 }
 
-pub fn sendHttpResponse(writer: anytype, status: u16, status_text: []const u8, content_type: []const u8, extra_headers: []const [2][]const u8, body: []const u8) !void {
+fn headerValueIsSafe(value: []const u8) bool {
+    return std.mem.indexOfAny(u8, value, "\r\n") == null;
+}
+
+fn writeCorsHeaders(writer: anytype, ctx: RequestContext) !void {
+    if (ctx.allowed_origin) |origin| {
+        if (headerValueIsSafe(origin)) {
+            try std.fmt.format(writer, "Access-Control-Allow-Origin: {s}\r\n", .{origin});
+            try writer.writeAll("Vary: Origin\r\n");
+        }
+    }
+    try writer.writeAll("Access-Control-Allow-Methods: GET, POST, DELETE, OPTIONS\r\n");
+    try writer.writeAll("Access-Control-Allow-Headers: Content-Type, Authorization\r\n");
+}
+
+pub fn sendHttpResponseWithContext(writer: anytype, status: u16, status_text: []const u8, content_type: []const u8, extra_headers: []const [2][]const u8, body: []const u8, ctx: RequestContext) !void {
     try std.fmt.format(writer, "HTTP/1.1 {d} {s}\r\n", .{ status, status_text });
     try std.fmt.format(writer, "Content-Type: {s}\r\n", .{content_type});
     try std.fmt.format(writer, "Content-Length: {d}\r\n", .{body.len});
     try writer.writeAll("Connection: keep-alive\r\n");
-    try writer.writeAll("Access-Control-Allow-Origin: *\r\n");
-    try writer.writeAll("Access-Control-Allow-Methods: GET, POST, DELETE, OPTIONS\r\n");
-    try writer.writeAll("Access-Control-Allow-Headers: Content-Type, Authorization\r\n");
+    try writeCorsHeaders(writer, ctx);
     for (extra_headers) |h| try std.fmt.format(writer, "{s}: {s}\r\n", .{ h[0], h[1] });
     try writer.writeAll("\r\n");
     try writer.writeAll(body);
 }
 
-fn sendSseHeaders(writer: anytype) !void {
+pub fn sendHttpResponse(writer: anytype, status: u16, status_text: []const u8, content_type: []const u8, extra_headers: []const [2][]const u8, body: []const u8) !void {
+    try sendHttpResponseWithContext(writer, status, status_text, content_type, extra_headers, body, .{ .allowed_origin = null });
+}
+
+fn sendSseHeaders(writer: anytype, ctx: RequestContext) !void {
     try writer.writeAll("HTTP/1.1 200 OK\r\n");
     try writer.writeAll("Content-Type: text/event-stream\r\n");
     try writer.writeAll("Cache-Control: no-cache\r\n");
     try writer.writeAll("X-Accel-Buffering: no\r\n");
     try writer.writeAll("Connection: keep-alive\r\n");
-    try writer.writeAll("Access-Control-Allow-Origin: *\r\n");
-    try writer.writeAll("Access-Control-Allow-Methods: GET, POST, DELETE, OPTIONS\r\n");
-    try writer.writeAll("Access-Control-Allow-Headers: Content-Type, Authorization\r\n");
+    try writeCorsHeaders(writer, ctx);
     try writer.writeAll("\r\n");
 }
 
@@ -3033,9 +3294,22 @@ fn urlEncode(allocator: std.mem.Allocator, s: []const u8) ![]u8 {
     return result.toOwnedSlice();
 }
 
+fn isSafeRelativePath(path: []const u8) bool {
+    if (path.len == 0) return false;
+    if (std.fs.path.isAbsolute(path)) return false;
+    if (std.mem.indexOfScalar(u8, path, '\\') != null) return false;
+    var it = std.mem.splitScalar(u8, path, '/');
+    while (it.next()) |part| {
+        if (part.len == 0 or std.mem.eql(u8, part, ".") or std.mem.eql(u8, part, "..")) return false;
+    }
+    return true;
+}
+
 fn extractPreviewAndCount(msgs: []const Message) struct { preview: []const u8, count: usize } {
     var last_user: ?*const Message = null;
-    for (msgs) |*msg| if (std.mem.eql(u8, msg.role, "user")) { last_user = msg; };
+    for (msgs) |*msg| if (std.mem.eql(u8, msg.role, "user")) {
+        last_user = msg;
+    };
 
     var preview: []const u8 = "";
     if (last_user) |msg| {
@@ -3043,7 +3317,12 @@ fn extractPreviewAndCount(msgs: []const Message) struct { preview: []const u8, c
             .text => |t| preview = t,
             .parts => |parts| {
                 for (parts.items) |part| {
-                    if (std.mem.eql(u8, part.type, "text")) { if (part.text) |t| { preview = t; break; } }
+                    if (std.mem.eql(u8, part.type, "text")) {
+                        if (part.text) |t| {
+                            preview = t;
+                            break;
+                        }
+                    }
                 }
                 if (preview.len == 0) {
                     for (parts.items) |part| {
@@ -3061,7 +3340,10 @@ fn extractPreviewAndCount(msgs: []const Message) struct { preview: []const u8, c
     for (msgs) |msg| {
         if (std.mem.eql(u8, msg.role, "user") or std.mem.eql(u8, msg.role, "assistant")) {
             if (std.mem.eql(u8, msg.role, "assistant") and msg.tool_calls != null) {
-                const has_content = switch (msg.content) { .text => |t| t.len > 0, .parts => |p| p.items.len > 0 };
+                const has_content = switch (msg.content) {
+                    .text => |t| t.len > 0,
+                    .parts => |p| p.items.len > 0,
+                };
                 if (!has_content) continue;
             }
             count += 1;
@@ -3102,7 +3384,10 @@ fn msgsDbToReadable(allocator: std.mem.Allocator, msgs: []const Message) ![]u8 {
             };
             try writer.writeAll(",\"content\":");
             try writeJsonString(writer, content_str);
-            if (msg.tool_call_id) |id| { try writer.writeAll(",\"tool_call_id\":"); try writeJsonString(writer, id); }
+            if (msg.tool_call_id) |id| {
+                try writer.writeAll(",\"tool_call_id\":");
+                try writeJsonString(writer, id);
+            }
             try writer.writeAll(",\"is_tool_result\":true,\"has_image\":false,\"image_keys\":[]");
         } else {
             switch (msg.content) {
@@ -3130,15 +3415,24 @@ fn msgsDbToReadable(allocator: std.mem.Allocator, msgs: []const Message) ![]u8 {
                     }
                     var combined = std.ArrayList(u8).init(allocator);
                     defer combined.deinit();
-                    for (text_parts.items, 0..) |t, ti| { if (ti > 0) try combined.append('\n'); try combined.appendSlice(t); }
+                    for (text_parts.items, 0..) |t, ti| {
+                        if (ti > 0) try combined.append('\n');
+                        try combined.appendSlice(t);
+                    }
                     try writer.writeAll(",\"content\":");
                     try writeJsonString(writer, combined.items);
                     try std.fmt.format(writer, ",\"has_image\":{}", .{has_image});
                     try writer.writeAll(",\"image_keys\":[");
-                    for (image_keys.items, 0..) |k, ki| { if (ki > 0) try writer.writeByte(','); try writeJsonString(writer, k); }
+                    for (image_keys.items, 0..) |k, ki| {
+                        if (ki > 0) try writer.writeByte(',');
+                        try writeJsonString(writer, k);
+                    }
                     try writer.writeByte(']');
                     try writer.writeAll(",\"parts\":[");
-                    for (parts.items, 0..) |part, pi| { if (pi > 0) try writer.writeByte(','); try serializeContentPart(writer, part); }
+                    for (parts.items, 0..) |part, pi| {
+                        if (pi > 0) try writer.writeByte(',');
+                        try serializeContentPart(writer, part);
+                    }
                     try writer.writeByte(']');
                 },
             }
@@ -3245,6 +3539,7 @@ fn handleRequest(allocator: std.mem.Allocator, conn: std.net.Server.Connection, 
     }
 
     const writer = conn.stream.writer();
+    const cors_ctx = RequestContext{ .allowed_origin = headers.get("origin") };
 
     if (content_length > 50 * 1024 * 1024) {
         try conn.stream.writeAll("HTTP/1.1 413 Payload Too Large\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
@@ -3260,8 +3555,9 @@ fn handleRequest(allocator: std.mem.Allocator, conn: std.net.Server.Connection, 
     const method = method_str;
 
     if (std.mem.eql(u8, method, "OPTIONS")) {
-        const resp = "HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, DELETE, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type, Authorization\r\nConnection: keep-alive\r\nContent-Length: 0\r\n\r\n";
-        conn.stream.writeAll(resp) catch {};
+        try writer.writeAll("HTTP/1.1 204 No Content\r\nConnection: keep-alive\r\nContent-Length: 0\r\n");
+        try writeCorsHeaders(writer, cors_ctx);
+        try writer.writeAll("\r\n");
         return !connection_close;
     }
 
@@ -3302,7 +3598,11 @@ fn handleRequest(allocator: std.mem.Allocator, conn: std.net.Server.Connection, 
     }
 
     if (std.mem.eql(u8, method, "GET") and std.mem.startsWith(u8, path_only, "/static/")) {
-        const rel = path_only[8..];
+        const rel = try urlDecode(arena_alloc, path_only[8..]);
+        if (!isSafeRelativePath(rel)) {
+            try sendHttpResponseWithContext(writer, 400, "Bad Request", "application/json", &[_][2][]const u8{}, "{\"detail\":\"Invalid path\"}", cors_ctx);
+            return !connection_close;
+        }
         const file_path = try std.fs.path.join(arena_alloc, &[_][]const u8{ static_dir, rel });
         const f = std.fs.openFileAbsolute(file_path, .{}) catch {
             try sendHttpResponse(writer, 404, "Not Found", "application/json", &[_][2][]const u8{}, "{\"detail\":\"Not found\"}");
@@ -3322,6 +3622,10 @@ fn handleRequest(allocator: std.mem.Allocator, conn: std.net.Server.Connection, 
     if (std.mem.eql(u8, method, "GET") and std.mem.startsWith(u8, path_only, "/api/image/")) {
         const key_encoded = path_only[11..];
         const key = try urlDecode(arena_alloc, key_encoded);
+        if (!isSafeRelativePath(key)) {
+            try sendHttpResponseWithContext(writer, 400, "Bad Request", "application/json", &[_][2][]const u8{}, "{\"detail\":\"Invalid image key\"}", cors_ctx);
+            return !connection_close;
+        }
         const image_dir = try std.fs.path.join(arena_alloc, &[_][]const u8{ project_root, "images" });
         const image_path = try std.fs.path.join(arena_alloc, &[_][]const u8{ image_dir, key });
         const f = std.fs.openFileAbsolute(image_path, .{}) catch {
@@ -3335,12 +3639,19 @@ fn handleRequest(allocator: std.mem.Allocator, conn: std.net.Server.Connection, 
         };
         const detected = detectImageFormat(data);
         var mime = detected.mime;
-        if (std.mem.eql(u8, mime, "application/octet-stream")) { const ext = std.fs.path.extension(key); if (extToMime(ext)) |m| mime = m; }
+        if (std.mem.eql(u8, mime, "application/octet-stream")) {
+            const ext = std.fs.path.extension(key);
+            if (extToMime(ext)) |m| mime = m;
+        }
         try sendHttpResponse(writer, 200, "OK", mime, &[_][2][]const u8{.{ "Cache-Control", "public, max-age=86400" }}, data);
         return !connection_close;
     }
 
     if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path_only, "/api/sessions")) {
+        const auth_email = getAuthEmailFromToken(arena_alloc, &headers) orelse {
+            try sendHttpResponseWithContext(writer, 401, "Unauthorized", "application/json", &[_][2][]const u8{}, "{\"error\":\"Nincs bejelentkezve\"}", cors_ctx);
+            return !connection_close;
+        };
         const now = nowSeconds();
 
         var deleted_set = std.StringHashMap(void).init(arena_alloc);
@@ -3365,6 +3676,8 @@ fn handleRequest(allocator: std.mem.Allocator, conn: std.net.Server.Connection, 
             var it = sessions_map.iterator();
             while (it.next()) |entry| {
                 if (deleted_set.get(entry.key_ptr.*) != null) continue;
+                const owner = entry.value_ptr.*.owner_email orelse continue;
+                if (!std.mem.eql(u8, owner, auth_email)) continue;
                 const pc = extractPreviewAndCount(entry.value_ptr.*.messages.items);
                 const sid_copy = arena_alloc.dupe(u8, entry.key_ptr.*) catch continue;
                 const preview_copy = arena_alloc.dupe(u8, pc.preview) catch continue;
@@ -3378,7 +3691,9 @@ fn handleRequest(allocator: std.mem.Allocator, conn: std.net.Server.Connection, 
         }
 
         std.sort.block(SessionEntryOwned, entries.items, {}, struct {
-            fn lessThan(_: void, a: SessionEntryOwned, b: SessionEntryOwned) bool { return a.updated_at > b.updated_at; }
+            fn lessThan(_: void, a: SessionEntryOwned, b: SessionEntryOwned) bool {
+                return a.updated_at > b.updated_at;
+            }
         }.lessThan);
 
         var result_buf = std.ArrayList(u8).init(arena_alloc);
@@ -3403,6 +3718,10 @@ fn handleRequest(allocator: std.mem.Allocator, conn: std.net.Server.Connection, 
     }
 
     if (std.mem.eql(u8, method, "GET") and std.mem.startsWith(u8, path_only, "/api/session/")) {
+        const auth_email = getAuthEmailFromToken(arena_alloc, &headers) orelse {
+            try sendHttpResponseWithContext(writer, 401, "Unauthorized", "application/json", &[_][2][]const u8{}, "{\"error\":\"Nincs bejelentkezve\"}", cors_ctx);
+            return !connection_close;
+        };
         const sid = path_only[13..];
         if (isDeleted(sid)) {
             try sendHttpResponse(writer, 404, "Not Found", "application/json", &[_][2][]const u8{}, "{\"detail\":\"Session not found\"}");
@@ -3413,7 +3732,9 @@ fn handleRequest(allocator: std.mem.Allocator, conn: std.net.Server.Connection, 
             sessions_mutex.lock();
             defer sessions_mutex.unlock();
             if (sessions_map.getPtr(sid)) |sess| {
-                readable = msgsDbToReadable(arena_alloc, sess.messages.items) catch null;
+                if (sess.owner_email) |owner| {
+                    if (std.mem.eql(u8, owner, auth_email)) readable = msgsDbToReadable(arena_alloc, sess.messages.items) catch null;
+                }
             }
         }
         if (readable == null) {
@@ -3431,7 +3752,23 @@ fn handleRequest(allocator: std.mem.Allocator, conn: std.net.Server.Connection, 
     }
 
     if (std.mem.eql(u8, method, "DELETE") and std.mem.startsWith(u8, path_only, "/api/session/")) {
+        const auth_email = getAuthEmailFromToken(arena_alloc, &headers) orelse {
+            try sendHttpResponseWithContext(writer, 401, "Unauthorized", "application/json", &[_][2][]const u8{}, "{\"error\":\"Nincs bejelentkezve\"}", cors_ctx);
+            return !connection_close;
+        };
         const sid = path_only[13..];
+        var allowed = false;
+        {
+            sessions_mutex.lock();
+            defer sessions_mutex.unlock();
+            if (sessions_map.getPtr(sid)) |sess| {
+                if (sess.owner_email) |owner| allowed = std.mem.eql(u8, owner, auth_email);
+            }
+        }
+        if (!allowed) {
+            try sendHttpResponseWithContext(writer, 404, "Not Found", "application/json", &[_][2][]const u8{}, "{\"detail\":\"Session not found\"}", cors_ctx);
+            return !connection_close;
+        }
         markDeleted(sid);
 
         const session_lock = getOrCreateSessionLock(sid) catch {
@@ -3453,6 +3790,7 @@ fn handleRequest(allocator: std.mem.Allocator, conn: std.net.Server.Connection, 
         }
 
         session_lock.unlock();
+        cleanupSessionResources(sid);
 
         if (found) {
             saveSessionsToDisk();
@@ -3498,7 +3836,7 @@ fn handleRequest(allocator: std.mem.Allocator, conn: std.net.Server.Connection, 
     }
 
     if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path_only, "/api/chat")) {
-        try handleChatEndpoint(arena_alloc, conn, body);
+        try handleChatEndpoint(arena_alloc, conn, body, &headers, cors_ctx);
         return false;
     }
 
@@ -3571,7 +3909,10 @@ fn parseChatRequest(allocator: std.mem.Allocator, body: []const u8) !ChatRequest
                 const mime_str = if (semi_pos) |pos| header[0..pos] else header;
                 var valid_mime = false;
                 for (ALLOWED_IMAGE_MIMES) |allowed| {
-                    if (std.mem.eql(u8, mime_str, allowed)) { valid_mime = true; break; }
+                    if (std.mem.eql(u8, mime_str, allowed)) {
+                        valid_mime = true;
+                        break;
+                    }
                 }
                 if (!valid_mime) continue;
                 const mime_copy = try allocator.dupe(u8, mime_str);
@@ -3586,7 +3927,7 @@ fn parseChatRequest(allocator: std.mem.Allocator, body: []const u8) !ChatRequest
     return ChatRequestData{ .session_id = session_id, .message = message, .images = images };
 }
 
-fn getOrCreateSession(allocator: std.mem.Allocator, session_id: ?[]const u8) !struct { sid: []u8, history: std.ArrayList(Message) } {
+fn getOrCreateSession(allocator: std.mem.Allocator, session_id: ?[]const u8, owner_email: []const u8) !struct { sid: []u8, history: std.ArrayList(Message) } {
     var sid: []u8 = undefined;
     if (session_id) |given_sid| {
         sid = if (isDeleted(given_sid)) try generateUuid(allocator) else try allocator.dupe(u8, given_sid);
@@ -3599,6 +3940,8 @@ fn getOrCreateSession(allocator: std.mem.Allocator, session_id: ?[]const u8) !st
         sessions_mutex.lock();
         defer sessions_mutex.unlock();
         if (sessions_map.getPtr(sid)) |sess| {
+            const owner = sess.owner_email orelse return error.Unauthorized;
+            if (!std.mem.eql(u8, owner, owner_email)) return error.Unauthorized;
             sess.updated_at = nowSeconds();
             var history = std.ArrayList(Message).init(allocator);
             errdefer {
@@ -3616,6 +3959,8 @@ fn getOrCreateSession(allocator: std.mem.Allocator, session_id: ?[]const u8) !st
     defer sessions_mutex.unlock();
 
     if (sessions_map.getPtr(sid)) |sess| {
+        const owner = sess.owner_email orelse return error.Unauthorized;
+        if (!std.mem.eql(u8, owner, owner_email)) return error.Unauthorized;
         sess.updated_at = nowSeconds();
         var history = std.ArrayList(Message).init(allocator);
         errdefer {
@@ -3629,7 +3974,7 @@ fn getOrCreateSession(allocator: std.mem.Allocator, session_id: ?[]const u8) !st
     const now = nowSeconds();
     const key = try global_allocator.dupe(u8, sid);
     errdefer global_allocator.free(key);
-    const sess = Session.init(global_allocator, now);
+    const sess = try Session.init(global_allocator, now, owner_email);
     try sessions_map.put(key, sess);
 
     const history = std.ArrayList(Message).init(allocator);
@@ -3651,12 +3996,18 @@ fn buildSseIdEvent(allocator: std.mem.Allocator, event_type: []const u8, field_n
     return buf.toOwnedSlice();
 }
 
-fn handleChatEndpoint(allocator: std.mem.Allocator, conn_in: std.net.Server.Connection, body: []const u8) !void {
+fn handleChatEndpoint(allocator: std.mem.Allocator, conn_in: std.net.Server.Connection, body: []const u8, headers: *const std.StringHashMap([]const u8), cors_ctx: RequestContext) !void {
     var conn = conn_in;
     const writer = conn.stream.writer();
 
+    const auth_email = getAuthEmailFromToken(allocator, headers) orelse {
+        try sendHttpResponseWithContext(writer, 401, "Unauthorized", "application/json", &[_][2][]const u8{}, "{\"error\":\"Nincs bejelentkezve\"}", cors_ctx);
+        return;
+    };
+    defer allocator.free(auth_email);
+
     if (hpc_ai_api_key.len == 0) {
-        try sendHttpResponse(writer, 503, "Service Unavailable", "application/json", &[_][2][]const u8{}, "{\"detail\":\"AI client not configured\"}");
+        try sendHttpResponseWithContext(writer, 503, "Service Unavailable", "application/json", &[_][2][]const u8{}, "{\"detail\":\"AI client not configured\"}", cors_ctx);
         return;
     }
 
@@ -3666,14 +4017,21 @@ fn handleChatEndpoint(allocator: std.mem.Allocator, conn_in: std.net.Server.Conn
     };
     defer req_data.deinit(allocator);
 
-    const session_result = getOrCreateSession(allocator, req_data.session_id) catch {
-        try sendHttpResponse(writer, 500, "Internal Server Error", "application/json", &[_][2][]const u8{}, "{\"detail\":\"Session error\"}");
+    const session_result = getOrCreateSession(allocator, req_data.session_id, auth_email) catch |err| {
+        if (err == error.Unauthorized) {
+            try sendHttpResponseWithContext(writer, 404, "Not Found", "application/json", &[_][2][]const u8{}, "{\"detail\":\"Session not found\"}", cors_ctx);
+            return;
+        }
+        try sendHttpResponseWithContext(writer, 500, "Internal Server Error", "application/json", &[_][2][]const u8{}, "{\"detail\":\"Session error\"}", cors_ctx);
         return;
     };
     const sid = session_result.sid;
     defer allocator.free(sid);
     var history = session_result.history;
-    defer { for (history.items) |*msg| msg.deinit(allocator); history.deinit(); }
+    defer {
+        for (history.items) |*msg| msg.deinit(allocator);
+        history.deinit();
+    }
 
     const session_lock = getOrCreateSessionLock(sid) catch {
         try sendHttpResponse(writer, 500, "Internal Server Error", "application/json", &[_][2][]const u8{}, "{\"detail\":\"Internal error\"}");
@@ -3686,7 +4044,7 @@ fn handleChatEndpoint(allocator: std.mem.Allocator, conn_in: std.net.Server.Conn
     };
     defer allocator.free(msg_id);
 
-    try sendSseHeaders(writer);
+    try sendSseHeaders(writer, cors_ctx);
 
     {
         var sess_ev_buf = std.ArrayList(u8).init(allocator);
@@ -3717,7 +4075,7 @@ fn handleChatEndpoint(allocator: std.mem.Allocator, conn_in: std.net.Server.Conn
         if (!sessions_map.contains(sid)) {
             const key = try global_allocator.dupe(u8, sid);
             const now = nowSeconds();
-            var sess = Session.init(global_allocator, now);
+            var sess = try Session.init(global_allocator, now, auth_email);
             for (history.items) |msg| try sess.messages.append(try msg.clone(global_allocator));
             try sessions_map.put(key, sess);
         }
@@ -3774,7 +4132,8 @@ fn handleChatEndpoint(allocator: std.mem.Allocator, conn_in: std.net.Server.Conn
             const user_msg = Message{
                 .role = role_copy,
                 .content = user_content,
-                .tool_calls = null, .tool_call_id = null,
+                .tool_calls = null,
+                .tool_call_id = null,
                 .msg_id = mid_copy,
                 .cached_size = null,
             };
@@ -3804,7 +4163,10 @@ fn handleChatEndpoint(allocator: std.mem.Allocator, conn_in: std.net.Server.Conn
             if (sessions_map.getPtr(sid)) |sess| break :blk try buildApiMessages(allocator, sess.messages.items);
             break :blk std.ArrayList(Message).init(allocator);
         };
-        defer { for (api_history.items) |*msg| msg.deinit(allocator); api_history.deinit(); }
+        defer {
+            for (api_history.items) |*msg| msg.deinit(allocator);
+            api_history.deinit();
+        }
 
         if (api_history.items.len == 0) {
             sendErrorEvent(allocator, writer, error.SessionDeleted) catch {};
@@ -3821,12 +4183,18 @@ fn handleChatEndpoint(allocator: std.mem.Allocator, conn_in: std.net.Server.Conn
         defer allocator.free(sys_prompt);
 
         var all_messages = std.ArrayList(Message).init(allocator);
-        defer { for (all_messages.items) |*msg| msg.deinit(allocator); all_messages.deinit(); }
+        defer {
+            for (all_messages.items) |*msg| msg.deinit(allocator);
+            all_messages.deinit();
+        }
 
         try all_messages.append(Message{
             .role = try allocator.dupe(u8, "system"),
             .content = MessageContent{ .text = try allocator.dupe(u8, sys_prompt) },
-            .tool_calls = null, .tool_call_id = null, .msg_id = null, .cached_size = null,
+            .tool_calls = null,
+            .tool_call_id = null,
+            .msg_id = null,
+            .cached_size = null,
         });
         for (api_history.items) |msg| try all_messages.append(try msg.clone(allocator));
 
@@ -3835,7 +4203,11 @@ fn handleChatEndpoint(allocator: std.mem.Allocator, conn_in: std.net.Server.Conn
         defer allocator.free(request_body);
 
         var tool_call_chunks = std.AutoHashMap(usize, *llm.ToolCallAccumulator).init(allocator);
-        defer { var it = tool_call_chunks.iterator(); while (it.next()) |entry| entry.value_ptr.*.deinit(); tool_call_chunks.deinit(); }
+        defer {
+            var it = tool_call_chunks.iterator();
+            while (it.next()) |entry| entry.value_ptr.*.deinit();
+            tool_call_chunks.deinit();
+        }
 
         var finish_reason: ?[]u8 = null;
         defer if (finish_reason) |fr| allocator.free(fr);
@@ -3894,7 +4266,10 @@ fn handleChatEndpoint(allocator: std.mem.Allocator, conn_in: std.net.Server.Conn
             std.sort.block(usize, sorted_indices.items, {}, std.sort.asc(usize));
 
             var tool_calls_list = std.ArrayList(ToolCall).init(allocator);
-            defer { for (tool_calls_list.items) |*tc| tc.deinit(allocator); tool_calls_list.deinit(); }
+            defer {
+                for (tool_calls_list.items) |*tc| tc.deinit(allocator);
+                tool_calls_list.deinit();
+            }
 
             for (sorted_indices.items) |idx| {
                 const acc = tool_call_chunks.get(idx).?;
@@ -3943,7 +4318,10 @@ fn handleChatEndpoint(allocator: std.mem.Allocator, conn_in: std.net.Server.Conn
                         const asst_msg = Message{
                             .role = role_copy,
                             .content = MessageContent{ .text = content_copy },
-                            .tool_calls = tcs_clone, .tool_call_id = null, .msg_id = null, .cached_size = null,
+                            .tool_calls = tcs_clone,
+                            .tool_call_id = null,
+                            .msg_id = null,
+                            .cached_size = null,
                         };
                         try sess.messages.append(asst_msg);
                         tcs_appended = true;
@@ -3993,7 +4371,11 @@ fn handleChatEndpoint(allocator: std.mem.Allocator, conn_in: std.net.Server.Conn
                         try writeJsonString(ew, tc.id);
                         try ew.writeAll(",\"error\":");
                         const friendly_err = errorToHungarian(err);
-                        if (friendly_err.len > 0) { try writeJsonString(ew, friendly_err); } else { try writeJsonString(ew, @errorName(err)); }
+                        if (friendly_err.len > 0) {
+                            try writeJsonString(ew, friendly_err);
+                        } else {
+                            try writeJsonString(ew, @errorName(err));
+                        }
                         try ew.writeByte('}');
                         try sendSseEvent(writer, ev_buf.items);
                         const err_text = try std.fmt.allocPrint(allocator, "Search failed: {s}", .{@errorName(err)});
@@ -4004,8 +4386,10 @@ fn handleChatEndpoint(allocator: std.mem.Allocator, conn_in: std.net.Server.Conn
                         break :blk3 Message{
                             .role = err_role,
                             .content = MessageContent{ .text = err_text },
-                            .tool_calls = null, .tool_call_id = err_tcid,
-                            .msg_id = null, .cached_size = null,
+                            .tool_calls = null,
+                            .tool_call_id = err_tcid,
+                            .msg_id = null,
+                            .cached_size = null,
                         };
                     };
                     var tool_msg_local = tool_msg;
@@ -4035,18 +4419,31 @@ fn handleChatEndpoint(allocator: std.mem.Allocator, conn_in: std.net.Server.Conn
                     try sendSseEvent(writer, ev_buf.items);
 
                     const t_role = global_allocator.dupe(u8, "tool") catch continue;
-                    const t_content = std.fmt.allocPrint(global_allocator, "Error: unknown tool '{s}'", .{tc.function.name}) catch { global_allocator.free(t_role); continue; };
-                    const t_tcid = global_allocator.dupe(u8, tc.id) catch { global_allocator.free(t_role); global_allocator.free(t_content); continue; };
+                    const t_content = std.fmt.allocPrint(global_allocator, "Error: unknown tool '{s}'", .{tc.function.name}) catch {
+                        global_allocator.free(t_role);
+                        continue;
+                    };
+                    const t_tcid = global_allocator.dupe(u8, tc.id) catch {
+                        global_allocator.free(t_role);
+                        global_allocator.free(t_content);
+                        continue;
+                    };
                     const tool_msg = Message{
-                        .role = t_role, .content = MessageContent{ .text = t_content },
-                        .tool_calls = null, .tool_call_id = t_tcid,
-                        .msg_id = null, .cached_size = null,
+                        .role = t_role,
+                        .content = MessageContent{ .text = t_content },
+                        .tool_calls = null,
+                        .tool_call_id = t_tcid,
+                        .msg_id = null,
+                        .cached_size = null,
                     };
                     sessions_mutex.lock();
                     defer sessions_mutex.unlock();
                     if (sessions_map.getPtr(sid)) |sess| {
                         if (!isDeleted(sid)) {
-                            sess.messages.append(tool_msg) catch { var tm = tool_msg; tm.deinit(global_allocator); };
+                            sess.messages.append(tool_msg) catch {
+                                var tm = tool_msg;
+                                tm.deinit(global_allocator);
+                            };
                             try trimHistory(global_allocator, &sess.messages);
                             sess.updated_at = nowSeconds();
                         } else {
@@ -4083,8 +4480,12 @@ fn handleChatEndpoint(allocator: std.mem.Allocator, conn_in: std.net.Server.Conn
                             errdefer global_allocator.free(r);
                             const c = try global_allocator.dupe(u8, final_content);
                             const asst_msg = Message{
-                                .role = r, .content = MessageContent{ .text = c },
-                                .tool_calls = null, .tool_call_id = null, .msg_id = null, .cached_size = null,
+                                .role = r,
+                                .content = MessageContent{ .text = c },
+                                .tool_calls = null,
+                                .tool_call_id = null,
+                                .msg_id = null,
+                                .cached_size = null,
                             };
                             try sess.messages.append(asst_msg);
                         }
@@ -4114,8 +4515,12 @@ fn handleChatEndpoint(allocator: std.mem.Allocator, conn_in: std.net.Server.Conn
                 errdefer global_allocator.free(r);
                 const c = try global_allocator.dupe(u8, "Tool iteration limit reached. Please try your question again.");
                 const asst_msg = Message{
-                    .role = r, .content = MessageContent{ .text = c },
-                    .tool_calls = null, .tool_call_id = null, .msg_id = null, .cached_size = null,
+                    .role = r,
+                    .content = MessageContent{ .text = c },
+                    .tool_calls = null,
+                    .tool_call_id = null,
+                    .msg_id = null,
+                    .cached_size = null,
                 };
                 try sess.messages.append(asst_msg);
                 try trimHistory(global_allocator, &sess.messages);
@@ -4191,7 +4596,10 @@ pub fn main() !void {
     std.log.info("Helium server running on port {d}", .{server_port});
 
     while (true) {
-        const conn = server.accept() catch |err| { std.log.err("Accept error: {}", .{err}); continue; };
+        const conn = server.accept() catch |err| {
+            std.log.err("Accept error: {}", .{err});
+            continue;
+        };
         const thread_alloc = global_allocator;
         const ctx = ConnectionContext{ .conn = conn, .allocator = thread_alloc };
         const thread = std.Thread.spawn(.{}, handleConnection, .{ctx}) catch |err| {
